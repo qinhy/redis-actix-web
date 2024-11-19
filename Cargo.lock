@@ -258,6 +258,7 @@ dependencies = [
  "actix-rt",
  "actix-web",
  "actix-web-actors",
+ "bytes",
  "futures-util",
  "redis",
  "serde",

@@ -1,5 +1,6 @@
-use actix_web::{web, App, HttpServer, HttpResponse, Responder, get, post, Error};
+use actix_web::{get, post, web, App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web::web::Data;
+use actix_web::http::{StatusCode, header};
 use std::io;
 use std::sync::Mutex;
 use redis::{Commands, Client};
@@ -7,7 +8,9 @@ use tokio_stream::{self as stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::fs::read_to_string;
 use futures_util::stream::unfold;
+use futures_util::stream::poll_fn;
 use actix_web::web::Bytes;
+use std::task::{Context, Poll};
 
 #[derive(Deserialize)]
 struct PubSubMessage {
@@ -38,69 +41,66 @@ async fn publish_message(data: web::Data<AppState>, msg: web::Json<PubSubMessage
 async fn subscribe_channel(
     data: web::Data<AppState>,
     channel: web::Path<String>,
+    req: HttpRequest, // Include the request to monitor connection status
 ) -> impl Responder {
     let channel_name = channel.into_inner();
-    println!("Subscribing to channel: {}", channel_name);
+    println!("Subscribing to channel via SSE: {}", channel_name);
     let client = data.redis_client.clone();
-    println!("Cloned Redis client");
+    let mut counter: usize = 5;
 
-    let stream = unfold((channel_name, client), |(channel_name, client)| async {
-        println!("Attempting to get Redis connection...");
-        let mut connection = match client.get_connection() {
-            Ok(conn) => {
-                println!("Successfully obtained Redis connection");
-                conn
-            },
-            Err(e) => {
-                println!("Failed to obtain Redis connection: {:?}", e);
-                return None;
-            }
-        };
+    println!("Attempting to get Redis connection...");
+    let mut connection = match client.get_connection() {
+        Ok(conn) => conn,
+        Err(e) => {
+            println!("Failed to obtain Redis connection: {:?}", e);
+            // return Poll::Ready(None);
+            return  HttpResponse::NotFound().body("Not found Redis connection");
+        }
+    };
+
+    // Create a `poll_fn`-based stream
+    let server_events = poll_fn(move |cx: &mut Context<'_>| -> Poll<Option<Result<Bytes, Error>>> {
+        if counter == 0 {
+            return Poll::Ready(None);
+        }
+        let payload = format!("data: {}\n\n", counter);
+        counter -= 1;
 
         let mut pubsub = connection.as_pubsub();
-        println!("Attempting to subscribe to channel: {}", channel_name);
-        match pubsub.subscribe(&channel_name) {
-            Ok(_) => println!("Successfully subscribed to channel: {}", channel_name),
-            Err(e) => {
-                println!("Failed to subscribe to channel: {:?} - Continuing", e);
-            }
+        println!("Subscribing to channel: {}", channel_name);
+        if let Err(e) = pubsub.subscribe(&channel_name) {
+            println!("Failed to subscribe to channel: {:?}", e);
+            return Poll::Ready(None);
         }
 
-        println!("Waiting for a message...");
-        let msg = pubsub.get_message().ok();
-        if let Some(ref message) = msg {
-            println!("Received a message");
-        } else {
-            println!("No message received or an error occurred");
+        // Try to get a message; this simulates the non-blocking behavior
+        let msg = match pubsub.get_message() {
+            Ok(message) => Some(message),
+            Err(_) => None, // Returning None on error ends the stream
+        };
+
+        if let Some(message) = msg {
+            let payload = match message.get_payload::<String>() {
+                Ok(payload) => payload,
+                Err(_) => "Invalid UTF-8 payload".to_string(),
+            };
+            println!("Message content: {}", payload);
+            let event = format!("data: {}\n\n", payload);
+            return Poll::Ready(Some(Ok(Bytes::from(event))));
         }
 
-        let message = msg
-            .as_ref()
-            .map(|m| m.get_payload::<String>().unwrap_or_else(|_| {
-                println!("Failed to decode message payload");
-                "Invalid UTF-8 payload".to_string()
-            }));
-        
-        match message {
-            Some(m) => {
-                println!("Message content: {}", m);
-                // Convert message to web::Bytes and immediately flush it
-                let event = format!("data: {}\n\n", m);
-                Some((Ok::<_, actix_web::Error>(web::Bytes::from(event)), (channel_name, client)))
-            },
-            None => {
-                println!("No valid message to process");
-                None
-            }
-        }
+        // If no message, return Pending to keep the connection open
+        cx.waker().wake_by_ref(); // Ensure we are polled again
+        Poll::Pending
     });
 
-    HttpResponse::Ok()
-        .content_type("text/event-stream")
-        // .no_chunking() // Ensures immediate delivery of each message
-        .streaming(stream)
-}
 
+    HttpResponse::Ok()
+    .content_type("text/event-stream")
+    .append_header(("content-encoding","identity"))
+    .streaming(server_events)
+
+}
 
 
 #[actix_web::main]
