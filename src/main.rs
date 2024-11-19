@@ -34,39 +34,73 @@ async fn publish_message(data: web::Data<AppState>, msg: web::Json<PubSubMessage
     HttpResponse::Ok().json(format!("Message published to channel '{}'", msg.channel))
 }
 
-// #[get("/redis/sub/{channel}")]
-// async fn subscribe_channel(
-//     data: web::Data<AppState>,
-//     channel: web::Path<String>,
-// ) -> impl Responder {
-//     let client = data.redis_client.clone();
-//     let mut connection = match client.get_connection() {
-//         Ok(conn) => conn,
-//         Err(_) => return HttpResponse::InternalServerError().body("Failed to connect to Redis"),
-//     };
+#[get("/redis/sub/{channel}")]
+async fn subscribe_channel(
+    data: web::Data<AppState>,
+    channel: web::Path<String>,
+) -> impl Responder {
+    let channel_name = channel.into_inner();
+    println!("Subscribing to channel: {}", channel_name);
+    let client = data.redis_client.clone();
+    println!("Cloned Redis client");
 
-//     let channel_name = channel.into_inner();
-//     let mut pubsub = connection.as_pubsub();
-//     match pubsub.subscribe(&channel_name) {
-//         Ok(_) => (),
-//         Err(_) => return HttpResponse::InternalServerError().body("Failed to subscribe to channel"),
-//     }
+    let stream = unfold((channel_name, client), |(channel_name, client)| async {
+        println!("Attempting to get Redis connection...");
+        let mut connection = match client.get_connection() {
+            Ok(conn) => {
+                println!("Successfully obtained Redis connection");
+                conn
+            },
+            Err(e) => {
+                println!("Failed to obtain Redis connection: {:?}", e);
+                return None;
+            }
+        };
 
-//     let stream = unfold(pubsub, |mut pubsub| async {
-//         let msg = pubsub.get_message().ok();
-//         let message = msg
-//             .as_ref()
-//             .map(|m| m.get_payload::<String>().unwrap_or_else(|_| "Invalid UTF-8 payload".to_string()));
-//         match message {
-//             Some(m) => Some((Ok::<_, actix_web::Error>(web::Bytes::from(m)), pubsub)),
-//             None => None,
-//         }
-//     });
+        let mut pubsub = connection.as_pubsub();
+        println!("Attempting to subscribe to channel: {}", channel_name);
+        match pubsub.subscribe(&channel_name) {
+            Ok(_) => println!("Successfully subscribed to channel: {}", channel_name),
+            Err(e) => {
+                println!("Failed to subscribe to channel: {:?} - Continuing", e);
+            }
+        }
 
-//     HttpResponse::Ok()
-//         .content_type("text/plain")
-//         .streaming(stream)
-// }
+        println!("Waiting for a message...");
+        let msg = pubsub.get_message().ok();
+        if let Some(ref message) = msg {
+            println!("Received a message");
+        } else {
+            println!("No message received or an error occurred");
+        }
+
+        let message = msg
+            .as_ref()
+            .map(|m| m.get_payload::<String>().unwrap_or_else(|_| {
+                println!("Failed to decode message payload");
+                "Invalid UTF-8 payload".to_string()
+            }));
+        
+        match message {
+            Some(m) => {
+                println!("Message content: {}", m);
+                // Convert message to web::Bytes and immediately flush it
+                let event = format!("data: {}\n\n", m);
+                Some((Ok::<_, actix_web::Error>(web::Bytes::from(event)), (channel_name, client)))
+            },
+            None => {
+                println!("No valid message to process");
+                None
+            }
+        }
+    });
+
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        // .no_chunking() // Ensures immediate delivery of each message
+        .streaming(stream)
+}
+
 
 
 #[actix_web::main]
@@ -80,7 +114,7 @@ async fn main() -> std::io::Result<()> {
             }))
             .service(get_homepage)
             .service(publish_message)
-            // .service(subscribe_channel)
+            .service(subscribe_channel)
     })
     .bind("127.0.0.1:8080")?
     .run()
