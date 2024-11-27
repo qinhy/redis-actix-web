@@ -14,8 +14,7 @@ use std::task::{Context, Poll};
 
 #[derive(Deserialize)]
 struct PubSubMessage {
-    channel: String,
-    message: String,
+    data: String,
 }
 
 struct AppState {
@@ -30,12 +29,24 @@ async fn get_homepage() -> Result<impl Responder, Error> {
     }
 }
 
-#[post("/redis/pub/")]
-async fn publish_message(data: web::Data<AppState>, msg: web::Json<PubSubMessage>) -> impl Responder {
+#[post("/redis/pub/{channel}")]
+async fn publish_message(data: web::Data<AppState>, channel: web::Path<String>, msg: web::Json<PubSubMessage>) -> impl Responder {
+    let channel_name = channel.into_inner();
     let mut conn = data.redis_client.get_connection().unwrap();
-    let _: () = conn.publish(&msg.channel, &msg.message).unwrap();
-    HttpResponse::Ok().json(format!("Message published to channel '{}'", msg.channel))
+    let _: () = conn.publish(channel_name.clone(), &msg.data).unwrap();
+    HttpResponse::Ok().json(format!("Message published to channel '{}'", channel_name.clone()))
 }
+
+// #[post("/redis/pub/{channel}/{msg}")]
+// async fn publish_message(data: web::Data<AppState>,
+//     channel: web::Path<String>,
+//     msg: web::Path<String>,
+//     req: HttpRequest,) -> impl Responder {
+//     let channel_name = channel.into_inner();
+//     let mut conn = data.redis_client.get_connection().unwrap();
+//     let _: () = conn.publish(channel_name.clone(), msg.into_inner()).unwrap();
+//     HttpResponse::Ok().json(format!("Message published to channel '{}'", channel_name.clone()))
+// }
 
 #[get("/redis/sub/{channel}")]
 async fn subscribe_channel(
@@ -60,11 +71,10 @@ async fn subscribe_channel(
 
     // Create a `poll_fn`-based stream
     let server_events = poll_fn(move |cx: &mut Context<'_>| -> Poll<Option<Result<Bytes, Error>>> {
-        if counter == 0 {
-            return Poll::Ready(None);
-        }
-        let payload = format!("data: {}\n\n", counter);
-        counter -= 1;
+        // if counter == 0 {
+        //     return Poll::Ready(None);
+        // }
+        // counter -= 1;
 
         let mut pubsub = connection.as_pubsub();
         println!("Subscribing to channel: {}", channel_name);
